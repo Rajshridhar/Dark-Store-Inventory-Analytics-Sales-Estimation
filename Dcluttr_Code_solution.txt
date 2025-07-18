@@ -1,0 +1,294 @@
+
+/* Note-1 for Creating Database(Part-1) I had used MySQL Workbench and For Query(Part-2) I had used Google Big Query because Data is Too Large */
+
+# creating a database to store all .csv tables
+create database Shridhar;
+use Shridhar;
+
+
+drop table all_blinkit_category_scraping_stream;       -- used for Backup to free Memory
+
+-- creating first table named all_blinkit_category_scraping_stream
+CREATE TABLE all_blinkit_category_scraping_stream (
+    created_at datetime,
+    l1_category_id INT,
+    l2_category_id double,
+    store_id INT,
+    sku_id double,
+    sku_name text,
+    selling_price double,
+    mrp double,
+    inventory INT,
+    image_url TEXT,
+    brand_id INT,
+    brand text,
+    unit text,
+    PRIMARY KEY (created_at , sku_id , store_id)   
+  
+/* added primary key in the table. we have another option
+    ,which is to include foreign key by first creating blinkit_city_map so we can use
+    store_id as foreign key from this table in all_blinkit_category_scraping_stream. 
+    Although we have to join it sepeartely from merged table */ 
+); 
+
+drop table  blinkit_categories;   -- used for Backup to free Memory
+
+-- creating 2nd table blinkit_categories
+CREATE TABLE blinkit_categories (
+    l1_category text,
+    l1_category_id INT,
+    l2_category text,
+    l2_category_id double PRIMARY KEY
+);
+
+drop table blinkit_city_map;        -- used for Backup to free Memory
+
+
+# creating 3rd table blinkit_city_map
+CREATE TABLE blinkit_city_map (
+    store_id INT PRIMARY KEY,
+    city_name text
+);
+
+/* imported All these 3 file in the created tables from schemas to Table data Import wizard 
+ I can also include all tables without creating any table within this SQL file but I created to show */
+
+
+
+
+
+
+
+
+-- part_2  SQL Code On Google BigQuery
+
+--checking the number of rows in the data
+select count(*) from Shridhar.all_blinkit_category_scraping_stream;
+
+/* calculating total number of  distinct dark stores. It uses the 'blinkit_city_map' table to link store_ids to city_names */  
+WITH city_store_count AS (
+    SELECT 
+        city_name, 
+        COUNT(DISTINCT store_id) AS ds_count
+    FROM Shridhar.blinkit_city_map
+    GROUP BY city_name
+    
+),
+
+
+    --  preparing the raw data for inventory movement analysis.
+    -- It fetches 'store_id', 'sku_id', 'created_at', and 'inventory' from 'all_blinkit_category_scraping_stream'.
+    -- It then uses the LEAD window function to get the 'created_at' and 'inventory'
+    -- of the *next* recorded time slot for each unique 'store_id' and 'sku_id' combination, ordered by 'created_at'.
+base_lead AS (
+    SELECT 
+        store_id, 
+        sku_id, 
+        created_at, 
+        inventory,
+        LEAD(created_at) OVER (
+            PARTITION BY store_id, sku_id 
+            ORDER BY created_at
+        ) AS next_created_at,
+        LEAD(inventory) OVER (
+            PARTITION BY store_id, sku_id 
+            ORDER BY created_at
+        ) AS next_inventory
+    FROM Shridhar.all_blinkit_category_scraping_stream
+),
+
+    -- This CTE identifies potential sales based on inventory decreases.
+    -- If 'inventory' at the current time slot is greater than 'next_inventory', it implies a sale,
+    -- and the difference is calculated as 'sale'. Otherwise, 'sale' is NULL.
+  base_with_sales AS (
+    SELECT
+      store_id,
+      sku_id,
+      created_at,
+      next_created_at,
+      inventory,
+      next_inventory,
+      CASE
+        WHEN inventory > next_inventory THEN inventory - next_inventory
+        ELSE NULL
+      END AS sale
+    FROM
+      base_lead
+  ),
+
+    -- This CTE calculates a moving average of sales for scenarios where inventory increases (restock).
+    -- It computes the average of the 'sale' values from the 3 preceding records for the same store and SKU.
+    -- This helps estimate sales during periods of restock where direct inventory difference doesn't reflect sales.
+  base_with_moving_average AS (
+    SELECT
+      *,
+      AVG(sale) OVER (
+        PARTITION BY
+          store_id,
+          sku_id
+        ORDER BY
+          created_at ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING
+      ) AS avg_last_3_sales
+    FROM
+      base_with_sales
+  ),
+  
+
+-- This CTE determines the 'sales_in_interval' for each record.
+-- If inventory decreased (inventory > next_inventory), the difference is considered sales.
+-- If inventory increased (inventory < next_inventory), it uses the 'avg_last_3_sales' to estimate sales (handling restocks).
+-- If neither (inventory is same), sales are 0.
+interval_sales as(
+SELECT
+  store_id,
+  sku_id,
+  created_at,
+  DATE(created_at) AS date,
+  CASE
+    WHEN inventory > next_inventory THEN inventory - next_inventory
+    WHEN inventory < next_inventory THEN COALESCE(avg_last_3_sales, 0)
+    ELSE 0
+  END AS sales_in_interval
+FROM
+  base_with_moving_average
+WHERE
+  next_created_at IS NOT NULL
+),
+
+
+    -- This CTE aggregates the estimated sales at the 'store_id', 'sku_id', and daily 'date' level.
+    -- It sums up 'sales_in_interval' to get the total 'est_qty_sold' for each day, store, and SKU.
+store_sku_daily_sales AS (
+    SELECT 
+        store_id, 
+        sku_id,
+        date,
+        SUM(sales_in_interval) AS est_qty_sold
+    FROM interval_sales
+    GROUP BY store_id, sku_id, date
+),
+
+
+    -- This CTE further aggregates the estimated sales to the 'city_name', 'sku_id', and daily 'date' level.
+    -- It joins with 'blinkit_city_map' to map 'store_id' to 'city_name' and then sums 'est_qty_sold'.
+city_sku_daily_sales AS (
+    SELECT 
+        c.city_name,
+        s.date,
+        s.sku_id,
+        SUM(s.est_qty_sold) AS est_qty_sold
+    FROM store_sku_daily_sales s
+    JOIN Shridhar.blinkit_city_map c 
+        ON s.store_id = c.store_id
+    GROUP BY c.city_name, s.date, s.sku_id
+),
+
+
+    -- This CTE combines essential raw data from all three base tables.
+    -- It joins 'all_blinkit_category_scraping_stream' with 'blinkit_city_map' and 'blinkit_categories'
+    -- to get comprehensive details like city name, category names, and all SKU-related information.
+ base_data AS (
+    SELECT 
+        c.city_name,
+        DATE(s.created_at) AS date,
+        s.sku_id,
+        s.sku_name,
+        s.store_id,
+        s.inventory,
+        s.selling_price,
+        s.mrp,
+        s.brand_id,
+        s.brand,
+        s.image_url,
+        cat.l1_category_id,
+        cat.l1_category,
+        cat.l2_category_id,
+        cat.l2_category
+    FROM Shridhar.all_blinkit_category_scraping_stream s
+    JOIN Shridhar.blinkit_city_map c 
+        ON s.store_id = c.store_id
+    JOIN Shridhar.blinkit_categories cat 
+        ON s.l2_category_id = cat.l2_category_id
+),
+
+
+-- This CTE calculates various daily metrics for each city and SKU.
+-- It finds the number of listed dark stores ('listed_ds_count'), in-stock dark stores ('in_stock_count'),
+-- the most frequent selling price ('sp') and MRP ('mrp'), and aggregates other SKU details.
+city_sku_daily_metrics AS(
+
+SELECT
+  city_name,
+  date,
+  sku_id,
+  MIN(sku_name) AS sku_name,
+  COUNT(DISTINCT store_id) AS listed_ds_count,
+  COUNT(DISTINCT
+    CASE
+      WHEN inventory > 0 THEN store_id
+  END) AS in_stock_count,
+
+  --find the most frequent selling_price
+  APPROX_TOP_COUNT(selling_price, 1) [OFFSET(0)].value AS sp,
+
+  APPROX_TOP_COUNT(mrp, 1) [OFFSET(0)].value AS mrp,
+
+  MIN(brand_id) AS brand_id,
+  MIN(brand) AS brand,
+  MIN(image_url) AS image_url,
+  MIN(l1_category_id) AS l1_category_id,
+  MIN(l1_category) AS l1_category,
+  MIN(l2_category_id) AS l2_category_id,
+  MIN(l2_category) AS l2_category
+FROM
+  base_data
+GROUP BY
+  city_name,
+  date,
+  sku_id
+)
+
+
+-- Final SELECT statement to combine all calculated metrics and create the 'blinkit_city_insights' table.
+-- It joins the estimated sales, city/sku level metrics, and total dark store counts.
+-- It calculates 'est_sales_sp', 'est_sales_mrp', 'wt_osa' (weighted out-of-stock availability),
+-- 'wt_osa_ls' (weighted out-of-stock availability for listed stores), and 'discount_percent'.
+SELECT 
+    s.date,
+    m.brand_id,
+    m.brand,
+    m.image_url,
+    s.city_name,
+    s.sku_id,
+    m.sku_name,
+    m.l1_category_id AS category_id,
+    m.l1_category AS category_name,
+    m.l2_category_id AS sub_category_id,
+    m.l2_category AS sub_category_name,
+    s.est_qty_sold,
+    s.est_qty_sold * m.sp AS est_sales_sp,
+    s.est_qty_sold * m.mrp AS est_sales_mrp,
+    m.listed_ds_count,
+    c.ds_count,
+    m.in_stock_count,
+    m.in_stock_count / c.ds_count AS wt_osa, 
+    CASE 
+        WHEN m.listed_ds_count > 0 THEN m.in_stock_count / m.listed_ds_count
+        ELSE NULL 
+    END AS wt_osa_ls,
+    m.mrp,
+    m.sp,
+    CASE 
+        WHEN m.mrp > 0 THEN (m.mrp - m.sp) / m.mrp
+        ELSE NULL 
+    END AS discount_percent
+FROM city_sku_daily_sales s
+JOIN city_sku_daily_metrics m 
+    ON s.city_name = m.city_name 
+    AND s.date = m.date 
+    AND s.sku_id = m.sku_id
+JOIN city_store_count c 
+    ON s.city_name = c.city_name;
+
+
+
